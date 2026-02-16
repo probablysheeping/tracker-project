@@ -125,12 +125,22 @@ namespace PTVApp.Services
                     StopLatitude = (float)reader.GetDouble(reader.GetOrdinal("stop_latitude")),
                     StopLongitude = (float)reader.GetDouble(reader.GetOrdinal("stop_longitude")),
                     RouteType = reader.GetInt32(reader.GetOrdinal("route_type")),
-                    StopTicket = JsonSerializer.Deserialize<StopTicket>(
-                        reader.GetString(reader.GetOrdinal("stop_ticket"))) ?? new StopTicket(),
-                    Interchange = reader.GetFieldValue<int[]>(reader.GetOrdinal("interchange")),
-                    Suburb = reader.GetString(reader.GetOrdinal("stop_suburb")),
-                    Landmark = reader.GetString(reader.GetOrdinal("stop_landmark")),
-                    RouteIds = reader.GetFieldValue<int[]>(reader.GetOrdinal("route_ids"))
+                    StopTicket = reader.IsDBNull(reader.GetOrdinal("stop_ticket"))
+                        ? new StopTicket()
+                        : JsonSerializer.Deserialize<StopTicket>(
+                            reader.GetString(reader.GetOrdinal("stop_ticket"))) ?? new StopTicket(),
+                    Interchange = reader.IsDBNull(reader.GetOrdinal("interchange"))
+                        ? Array.Empty<int>()
+                        : reader.GetFieldValue<int[]>(reader.GetOrdinal("interchange")),
+                    Suburb = reader.IsDBNull(reader.GetOrdinal("stop_suburb"))
+                        ? string.Empty
+                        : reader.GetString(reader.GetOrdinal("stop_suburb")),
+                    Landmark = reader.IsDBNull(reader.GetOrdinal("stop_landmark"))
+                        ? string.Empty
+                        : reader.GetString(reader.GetOrdinal("stop_landmark")),
+                    RouteIds = reader.IsDBNull(reader.GetOrdinal("route_ids"))
+                        ? Array.Empty<int>()
+                        : reader.GetFieldValue<int[]>(reader.GetOrdinal("route_ids"))
                 });
             }
 
@@ -1367,13 +1377,40 @@ namespace PTVApp.Services
             await using var conn = new NpgsqlConnection(_connectionString);
             await conn.OpenAsync();
 
-            await using var cmdGetRouteId = new NpgsqlCommand(@"select route_gtfs_id from routes where route_id=@routeId;", conn);
+            await using var cmdGetRouteId = new NpgsqlCommand(@"select route_gtfs_id, route_type from routes where route_id=@routeId;", conn);
             cmdGetRouteId.Parameters.AddWithValue("routeId", routeId);
-            var gtfsRouteId = await cmdGetRouteId.ExecuteScalarAsync() as string ?? 
-            throw new Exception("Route id: " + routeId + "does not have gtfs id");
+            await using var routeReader = await cmdGetRouteId.ExecuteReaderAsync();
+            if (!await routeReader.ReadAsync())
+            {
+                throw new Exception("Route id: " + routeId + " not found");
+            }
+            var gtfsRouteId = routeReader.GetString(0);
+            var routeType = routeReader.GetInt32(1);
+            await routeReader.CloseAsync();
 
-            await using var cmdGetTripId = new NpgsqlCommand(@"select trip_id from gtfs_trips where route_id=@gtfsRouteId;", conn);
-            cmdGetTripId.Parameters.AddWithValue("gtfsRouteId", "aus:vic:vic-0"+gtfsRouteId+":");
+            // Construct GTFS route ID based on route type
+            // Format: aus:vic:vic-XX-ROUTEID: where XX is route type code
+            // 0=Train (02), 1=Tram (03), 2=Bus (no prefix), 3=V/Line (01), 4=Night Bus (no prefix)
+            string fullGtfsRouteId;
+            if (routeType == 0) // Train
+            {
+                fullGtfsRouteId = "aus:vic:vic-02-" + gtfsRouteId;
+            }
+            else if (routeType == 1) // Tram
+            {
+                fullGtfsRouteId = "aus:vic:vic-03-" + gtfsRouteId;
+            }
+            else if (routeType == 3) // V/Line
+            {
+                fullGtfsRouteId = "aus:vic:vic-01-" + gtfsRouteId;
+            }
+            else
+            {
+                throw new Exception("Geopath not supported for route type: " + routeType);
+            }
+
+            await using var cmdGetTripId = new NpgsqlCommand(@"select trip_id from gtfs_trips where route_id=@gtfsRouteId LIMIT 1;", conn);
+            cmdGetTripId.Parameters.AddWithValue("gtfsRouteId", fullGtfsRouteId);
             var tripId = await cmdGetTripId.ExecuteScalarAsync() as string ??
             throw new Exception("Trip id for " + gtfsRouteId + " not found");
             

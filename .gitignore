@@ -14,8 +14,11 @@ nul
 
 # Backups and large data files
 *.backup
-*.dump.gz
 database.dump
+
+# Database backups (allow database/ folder backups)
+!database/*.sql.gz
+!database/*.sql
 
 # GTFS data files (too large for GitHub, download separately)
 gtfs/*/google_transit.zip
@@ -25,7 +28,7 @@ gtfs/*/google_transit/stop_times.txt
 gtfs/*/google_transit/shapes.txt
 
 # IDE
-.vscode/
+# .vscode/ - now tracked for project configuration
 .idea/
 *.suo
 *.user

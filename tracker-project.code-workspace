@@ -1,0 +1,144 @@
+{
+  "folders": [
+    {
+      "name": "Tracker (Root)",
+      "path": "."
+    },
+    {
+      "name": "Backend (ASP.NET Core)",
+      "path": "tracker"
+    },
+    {
+      "name": "Frontend (React)",
+      "path": "tracker-frontend"
+    }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/node_modules": true,
+      "**/bin": true,
+      "**/obj": true,
+      "**/.vs": true
+    },
+    "search.exclude": {
+      "**/node_modules": true,
+      "**/bin": true,
+      "**/obj": true,
+      "**/dist": true
+    },
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": null,
+    "[javascript]": {
+      "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+    "[javascriptreact]": {
+      "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+    "[csharp]": {
+      "editor.defaultFormatter": "ms-dotnettools.csharp"
+    },
+    "javascript.updateImportsOnFileMove.enabled": "always",
+    "typescript.updateImportsOnFileMove.enabled": "always"
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-dotnettools.csharp",
+      "ms-dotnettools.csdevkit",
+      "esbenp.prettier-vscode",
+      "dbaeumer.vscode-eslint",
+      "dsznajder.es7-react-js-snippets",
+      "ms-vscode.vscode-typescript-next",
+      "formulahendry.auto-rename-tag",
+      "bradlc.vscode-tailwindcss",
+      "humao.rest-client"
+    ]
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Launch Backend (.NET)",
+        "type": "coreclr",
+        "request": "launch",
+        "preLaunchTask": "build-backend",
+        "program": "${workspaceFolder:Backend (ASP.NET Core)}/bin/Debug/net9.0/tracker.dll",
+        "args": [],
+        "cwd": "${workspaceFolder:Backend (ASP.NET Core)}",
+        "stopAtEntry": false,
+        "serverReadyAction": {
+          "action": "openExternally",
+          "pattern": "\\bNow listening on:\\s+(https?://\\S+)"
+        },
+        "env": {
+          "ASPNETCORE_ENVIRONMENT": "Development"
+        }
+      },
+      {
+        "name": "Launch Frontend (npm)",
+        "type": "node",
+        "request": "launch",
+        "cwd": "${workspaceFolder:Frontend (React)}",
+        "runtimeExecutable": "npm",
+        "runtimeArgs": ["run", "dev"],
+        "serverReadyAction": {
+          "pattern": "Local:\\s+(https?://\\S+)",
+          "uriFormat": "%s",
+          "action": "openExternally"
+        }
+      }
+    ],
+    "compounds": [
+      {
+        "name": "Full Stack (Backend + Frontend)",
+        "configurations": ["Launch Backend (.NET)", "Launch Frontend (npm)"],
+        "stopAll": true
+      }
+    ]
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      {
+        "label": "build-backend",
+        "command": "dotnet",
+        "type": "process",
+        "args": [
+          "build",
+          "${workspaceFolder:Backend (ASP.NET Core)}/tracker.csproj",
+          "/property:GenerateFullPaths=true",
+          "/consoleloggerparameters:NoSummary"
+        ],
+        "problemMatcher": "$msCompile"
+      },
+      {
+        "label": "run-backend",
+        "command": "dotnet",
+        "type": "process",
+        "args": [
+          "run",
+          "--project",
+          "${workspaceFolder:Backend (ASP.NET Core)}/tracker.csproj"
+        ],
+        "problemMatcher": "$msCompile"
+      },
+      {
+        "label": "run-frontend",
+        "type": "shell",
+        "command": "npm run dev",
+        "options": {
+          "cwd": "${workspaceFolder:Frontend (React)}"
+        },
+        "problemMatcher": []
+      },
+      {
+        "label": "install-frontend-deps",
+        "type": "shell",
+        "command": "npm install",
+        "options": {
+          "cwd": "${workspaceFolder:Frontend (React)}"
+        },
+        "problemMatcher": []
+      }
+    ]
+  }
+}
