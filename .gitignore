@@ -1,0 +1,37 @@
+# Build outputs
+tracker/bin
+tracker/obj
+tracker.Tests/bin
+tracker.Tests/obj
+**/node_modules/**
+tracker-frontend/dist
+
+# Temporary files
+*.log
+*.pyc
+*.tmp
+nul
+
+# Backups and large data files
+*.backup
+*.dump.gz
+database.dump
+
+# GTFS data files (too large for GitHub, download separately)
+gtfs/*/google_transit.zip
+gtfs/*/extracted/stop_times.txt
+gtfs/*/extracted/shapes.txt
+gtfs/*/google_transit/stop_times.txt
+gtfs/*/google_transit/shapes.txt
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Environment
+.env.local
+tracker-frontend/.env.production
+tracker-frontend/.env.development
+!tracker-frontend/.env.example
