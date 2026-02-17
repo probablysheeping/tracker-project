@@ -1776,7 +1776,7 @@ export default function MapRoutes() {
 
                     // Size multiplier based on route_type
                     // All sizes significantly increased for better visibility
-                    const sizeMultiplier = s.route_type === 1 ? 0.6 :   // Tram - 60% of train size (was 33%)
+                    const sizeMultiplier = s.route_type === 1 ? 0.3 :   // Tram - 30% of train size (halved from 60%)
                                           s.route_type === 2 ? 0.7 :   // Bus - 70% of train size
                                           s.route_type === 3 ? 1.5 :   // V/Line - 150% larger (regional stations)
                                           1.0;                          // Train - base size (100%)
