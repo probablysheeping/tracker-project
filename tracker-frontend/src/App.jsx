@@ -1011,6 +1011,12 @@ export default function MapRoutes() {
                                         {/* Display selected journey */}
                                         {plannedJourneys[selectedJourneyIndex]?.map((trip, idx) => {
                                             const route = getRouteById(trip.route_id);
+                                            // Use route info from trip response directly (populated by backend)
+                                            // Fall back to routes array lookup for map colour info
+                                            const tripColour = trip.route_colour || route?.color || "#888";
+                                            const tripRouteName = trip.route_name || route?.route_name;
+                                            const tripRouteNumber = trip.route_number || route?.route_number;
+                                            const tripRouteType = trip.route_type ?? route?.route_type;
                                             const originStop = getStopById(trip.origin_stop_id);
                                             const destStop = getStopById(trip.destination_stop_id);
                                             return (
@@ -1020,7 +1026,7 @@ export default function MapRoutes() {
                                                         marginBottom: idx < plannedJourneys[selectedJourneyIndex].length - 1 ? "0.5rem" : "0",
                                                         background: "rgba(255,255,255,0.05)",
                                                         borderRadius: "10px",
-                                                        border: `2px solid ${route?.color || "#888"}`,
+                                                        border: `2px solid ${tripColour}`,
                                                         boxShadow: "0 2px 8px rgba(0,0,0,0.2)"
                                                     }}>
                                                         <div style={{
@@ -1031,7 +1037,7 @@ export default function MapRoutes() {
                                                         }}>
                                                             <div style={{
                                                                 padding: "0.25rem 0.5rem",
-                                                                background: route?.color || "#888",
+                                                                background: tripColour,
                                                                 borderRadius: "6px",
                                                                 fontSize: "0.7rem",
                                                                 fontWeight: "700",
@@ -1042,22 +1048,22 @@ export default function MapRoutes() {
                                                             <div style={{
                                                                 fontWeight: "600",
                                                                 fontSize: "0.9rem",
-                                                                color: route?.color || "#888"
+                                                                color: tripColour
                                                             }}>
                                                                 {/* For trams/buses, show route number prominently */}
-                                                                {route && (route.route_type === 1 || route.route_type === 2) ? (
+                                                                {(tripRouteType === 1 || tripRouteType === 2) ? (
                                                                     <>
                                                                         <span style={{ fontWeight: "700", fontSize: "1rem" }}>
-                                                                            Route {route.route_number || route.route_id}
+                                                                            Route {tripRouteNumber || trip.route_id}
                                                                         </span>
-                                                                        {route.route_name && (
+                                                                        {tripRouteName && (
                                                                             <span style={{ fontWeight: "400", fontSize: "0.75rem", marginLeft: "0.5rem", opacity: 0.8 }}>
-                                                                                {route.route_name}
+                                                                                {tripRouteName}
                                                                             </span>
                                                                         )}
                                                                     </>
                                                                 ) : (
-                                                                    route?.route_name || `Route ${trip.route_id}`
+                                                                    tripRouteName || `Route ${trip.route_id}`
                                                                 )}
                                                             </div>
                                                         </div>
@@ -1779,7 +1785,7 @@ export default function MapRoutes() {
                     const sizeMultiplier = s.route_type === 1 ? 0.3 :   // Tram - 30% of train size (halved from 60%)
                                           s.route_type === 2 ? 0.7 :   // Bus - 70% of train size
                                           s.route_type === 3 ? 1.5 :   // V/Line - 150% larger (regional stations)
-                                          1.0;                          // Train - base size (100%)
+                                          0.6;                          // Train - 60% of original size
 
                     // Check if this stop is the selected origin or destination
                     const isOriginStop = s.stop_id === selectedOriginStopId;

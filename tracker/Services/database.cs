@@ -434,10 +434,45 @@ namespace PTVApp.Services
                 ORDER BY d.path_id, d.seq;
             ", conn);
 
-            // Use hub nodes (route_id = 0) for origin/destination
+            // Determine origin and destination nodes
+            // For tram/bus stops: use route nodes to force boarding the vehicle
+            // For train/V/Line stations: use hub nodes (they're the backbone)
+            long originNode, destinationNode;
+
+            // Get origin stop route_type
+            await using (var stopCmd = new NpgsqlCommand("SELECT route_type FROM stops WHERE stop_id = @stopId", conn))
+            {
+                stopCmd.Parameters.AddWithValue("stopId", originStopId);
+                var originRouteType = await stopCmd.ExecuteScalarAsync() as int?;
+
+                if (originRouteType == 1 || originRouteType == 2) // Tram or Bus
+                {
+                    // Find the first route serving this stop and use that route node
+                    await using (var routeCmd = new NpgsqlCommand(
+                        @"SELECT DISTINCT source_route FROM edges_v2
+                          WHERE (source_stop = @stopId OR target_stop = @stopId)
+                          AND edge_type = 'route' AND source_route != 0
+                          ORDER BY source_route LIMIT 1", conn))
+                    {
+                        routeCmd.Parameters.AddWithValue("stopId", originStopId);
+                        var originRouteId = await routeCmd.ExecuteScalarAsync() as int?;
+                        originNode = originRouteId.HasValue
+                            ? (long)originStopId * 1000000000L + originRouteId.Value
+                            : (long)originStopId * 1000000000L; // Fallback to hub if no route found
+                    }
+                }
+                else
+                {
+                    originNode = (long)originStopId * 1000000000L; // Hub node for train/V/Line
+                }
+            }
+
+            // Always use hub node for destination (user can alight and transfer as needed)
+            destinationNode = (long)destinationStopId * 1000000000L;
+
             // Must use NpgsqlDbType.Bigint explicitly for pgRouting to accept the parameter
-            cmd.Parameters.Add(new NpgsqlParameter("origin", NpgsqlTypes.NpgsqlDbType.Bigint) { Value = (long)originStopId * 1000000000L });
-            cmd.Parameters.Add(new NpgsqlParameter("destination", NpgsqlTypes.NpgsqlDbType.Bigint) { Value = (long)destinationStopId * 1000000000L });
+            cmd.Parameters.Add(new NpgsqlParameter("origin", NpgsqlTypes.NpgsqlDbType.Bigint) { Value = originNode });
+            cmd.Parameters.Add(new NpgsqlParameter("destination", NpgsqlTypes.NpgsqlDbType.Bigint) { Value = destinationNode });
             cmd.Parameters.Add(new NpgsqlParameter("k", NpgsqlTypes.NpgsqlDbType.Integer) { Value = k });
 
             // Collect path nodes grouped by path_id: pathId -> list of (stopId, routeId, lat, lon)
@@ -465,6 +500,37 @@ namespace PTVApp.Services
             if (pathNodesByPathId.Count == 0)
                 return (null, null);
 
+            // Load route info for all routes found in paths
+            var routeIds = pathNodesByPathId.Values.SelectMany(nodes => nodes.Select(n => n.RouteId)).Distinct().ToList();
+            var routeInfo = new Dictionary<int, (string Name, string? Number, int Type, string? Colour)>();
+            if (routeIds.Count > 0)
+            {
+                var routeIdList = string.Join(",", routeIds);
+                await using var routeInfoCmd = new NpgsqlCommand(
+                    $"SELECT route_id, route_name, route_number, route_type, route_colour FROM routes WHERE route_id IN ({routeIdList})", conn);
+                await using var routeInfoReader = await routeInfoCmd.ExecuteReaderAsync();
+                while (await routeInfoReader.ReadAsync())
+                {
+                    var rId = routeInfoReader.GetInt32(0);
+                    var rName = routeInfoReader.IsDBNull(1) ? $"Route {rId}" : routeInfoReader.GetString(1);
+                    var rNumber = routeInfoReader.IsDBNull(2) ? null : routeInfoReader.GetString(2);
+                    var rType = routeInfoReader.GetInt32(3);
+                    string? rColour = null;
+                    if (!routeInfoReader.IsDBNull(4))
+                    {
+                        try
+                        {
+                            // route_colour is stored as integer[] e.g. {21,44,107}
+                            var colourArr = routeInfoReader.GetFieldValue<int[]>(4);
+                            if (colourArr.Length == 3)
+                                rColour = $"#{colourArr[0]:X2}{colourArr[1]:X2}{colourArr[2]:X2}";
+                        }
+                        catch { /* ignore colour parse errors */ }
+                    }
+                    routeInfo[rId] = (rName, rNumber, rType, rColour);
+                }
+            }
+
             // Convert all paths to Trip segments grouped by journey
             var allJourneys = new List<List<Trip>>();
             int globalTripId = 1;
@@ -491,6 +557,7 @@ namespace PTVApp.Services
                         var segmentNodes = pathNodes.Skip(segmentStartIdx).Take(i - segmentStartIdx).ToList();
                         var geopath = await GetSegmentGeopathForRoute(conn, segmentNodes, currentRouteId);
 
+                        var ri = routeInfo.TryGetValue(currentRouteId, out var riVal) ? (riVal.Name, riVal.Number, riVal.Type, riVal.Colour) : ($"Route {currentRouteId}", (string?)null, 0, (string?)null);
                         journeyTrips.Add(new Trip
                         {
                             TripId = globalTripId++,
@@ -499,6 +566,10 @@ namespace PTVApp.Services
                             DepartureTime = DateTime.Now, // Placeholder - real time would come from GTFS
                             ArrivalTime = DateTime.Now,   // Placeholder
                             RouteId = currentRouteId,
+                            RouteName = ri.Item1,
+                            RouteNumber = ri.Item2,
+                            RouteType = ri.Item3,
+                            RouteColour = ri.Item4,
                             GeoPath = geopath
                         });
 
@@ -1046,6 +1117,10 @@ namespace PTVApp.Services
                                             DepartureTime = localDeparture,
                                             ArrivalTime = localArrival,
                                             RouteId = trip.RouteId,
+                                            RouteName = trip.RouteName,
+                                            RouteNumber = trip.RouteNumber,
+                                            RouteType = trip.RouteType,
+                                            RouteColour = trip.RouteColour,
                                             GeoPath = trip.GeoPath
                                         });
                                         currentTime = localArrival.ToUniversalTime();
@@ -1145,6 +1220,10 @@ namespace PTVApp.Services
                                     DepartureTime = localDeparture,
                                     ArrivalTime = localArrival,
                                     RouteId = trip.RouteId,
+                                    RouteName = trip.RouteName,
+                                    RouteNumber = trip.RouteNumber,
+                                    RouteType = trip.RouteType,
+                                    RouteColour = trip.RouteColour,
                                     GeoPath = trip.GeoPath
                                 });
 

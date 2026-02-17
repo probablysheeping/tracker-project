@@ -33,6 +33,18 @@ namespace PTVApp.Models
         [JsonPropertyName("route_id")]
         public required int RouteId { get; set; }
 
+        [JsonPropertyName("route_name")]
+        public string? RouteName { get; set; }
+
+        [JsonPropertyName("route_number")]
+        public string? RouteNumber { get; set; }
+
+        [JsonPropertyName("route_type")]
+        public int RouteType { get; set; }
+
+        [JsonPropertyName("route_colour")]
+        public string? RouteColour { get; set; }
+
         [JsonPropertyName("geopath")]
         public List<GeoPoint> GeoPath {get; set;} = [];
     }
