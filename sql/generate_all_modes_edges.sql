@@ -37,10 +37,13 @@ SELECT DISTINCT ON (r.route_id, s1.stop_id, s2.stop_id)
     (s2.stop_id::bigint * 1000000000 + r.route_id::bigint) AS target_node
 FROM routes r
 JOIN gtfs_routes gr ON (
-    -- For trains, trams, V/Line: use format 'aus:vic:vic-0X-XXX:'
-    (r.route_type IN (0, 1, 3) AND gr.route_id = 'aus:vic:vic-0' || r.route_gtfs_id || ':')
+    -- Trains: GTFS route_type=400, format 'aus:vic:vic-02-XXX:'
+    (r.route_type = 0 AND gr.route_type = 400 AND gr.route_id = 'aus:vic:vic-02-' || REPLACE(r.route_gtfs_id, ':', '') || ':')
+    -- Trams: GTFS route_type=0, format 'aus:vic:vic-03-XXX:' (strip '3-' prefix from route_gtfs_id)
+    OR (r.route_type = 1 AND gr.route_type = 0 AND gr.route_id = 'aus:vic:vic-03-' || REPLACE(REPLACE(r.route_gtfs_id, '3-', ''), ':', '') || ':')
+    -- V/Line: GTFS route_type=2, format 'aus:vic:vic-01-XXX:' (strip '1-' prefix from route_gtfs_id)
+    OR (r.route_type = 3 AND gr.route_type = 2 AND gr.route_id = 'aus:vic:vic-01-' || REPLACE(REPLACE(r.route_gtfs_id, '1-', ''), ':', '') || ':')
     -- Skip buses for now (too slow - 692 routes)
-    -- OR (r.route_type = 2 AND gr.route_id = r.route_gtfs_id)
 )
 JOIN gtfs_trips t ON t.route_id = gr.route_id
 JOIN gtfs_stop_times st1 ON st1.trip_id = t.trip_id

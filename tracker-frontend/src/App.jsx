@@ -2,7 +2,7 @@ import 'leaflet/dist/leaflet.css';
 import React, { useState, useEffect } from "react";
 import { MapContainer, TileLayer, Polyline, Circle, Tooltip, useMapEvents, Popup, Marker } from "react-leaflet";
 import L from 'leaflet';
-import { API_BASE_URL } from './config';
+import { API_BASE_URL, authenticatedFetch } from './config';
 
 function ZoomListener({ onZoomChange }) {
     useMapEvents({
@@ -35,6 +35,8 @@ export default function MapRoutes() {
     const [selectedJourneyIndex, setSelectedJourneyIndex] = useState(0); // Which journey to display
     const [tripError, setTripError] = useState("");
     const [isLoading, setIsLoading] = useState(false);
+    const [selectedOriginStopId, setSelectedOriginStopId] = useState(null); // For highlighting on map
+    const [selectedDestinationStopId, setSelectedDestinationStopId] = useState(null); // For highlighting on map
     const [departureTime, setDepartureTime] = useState(() => {
         // Default to current time
         const now = new Date();
@@ -59,14 +61,9 @@ export default function MapRoutes() {
         // Radius in meters - visually grows when zooming OUT, shrinks when zooming IN
         // Uses exponential scaling: larger meter radius at low zoom + zoomed out view = very large visual size
         // Smaller meter radius at high zoom + zoomed in view = very small visual size
-        // Min 5m (max zoom in), max 200m (max zoom out)
-        return Math.min(200, Math.max(5, 300 / Math.pow(2, zoomLevel - 11)));
-    };
-
-    const getVLineRadius = (zoomLevel) => {
-        // V/Line stops: 2x larger than normal train stops
-        // Min 12m (max zoom in), max 400m (max zoom out)
-        return Math.min(400, Math.max(12, 600 / Math.pow(2, zoomLevel - 11)));
+        // Significantly increased from previous values for better visibility
+        // Min 20m (max zoom in), max 600m (max zoom out) - 4x larger than before
+        return Math.min(600, Math.max(20, 800 / Math.pow(2, zoomLevel - 11)));
     };
 
     // Check if disruption is currently active based on time periods
@@ -274,17 +271,25 @@ export default function MapRoutes() {
 
         if (!originStop) {
             setTripError(`Could not find origin station: "${originInput}"`);
+            setSelectedOriginStopId(null);
+            setSelectedDestinationStopId(null);
             return;
         }
         if (!destStop) {
             setTripError(`Could not find destination station: "${destinationInput}"`);
+            setSelectedOriginStopId(null);
+            setSelectedDestinationStopId(null);
             return;
         }
+
+        // Set the selected stop IDs for map highlighting
+        setSelectedOriginStopId(originStop.stop_id);
+        setSelectedDestinationStopId(destStop.stop_id);
 
         setIsLoading(true);
         try {
             // Call the realtime endpoint with departure time
-            const res = await fetch(
+            const res = await authenticatedFetch(
                 `${API_BASE_URL}/api/PTV/tripPlanRealtime/${originStop.stop_id}/${destStop.stop_id}?departureTime=${encodeURIComponent(departureTime)}`
             );
             const data = await res.json();
@@ -344,7 +349,7 @@ export default function MapRoutes() {
     useEffect(() => {
         const loadAllStops = async () => {
             try {
-                const response = await fetch(`${API_BASE_URL}/api/PTV/stops?route_types=0,1,2,3,4`);
+                const response = await authenticatedFetch(`${API_BASE_URL}/api/PTV/stops?route_types=0,1,2,3,4`);
                 const data = await response.json();
                 setAllStops(data.stops || []);
             } catch (err) {
@@ -373,24 +378,33 @@ export default function MapRoutes() {
 
                 // Fetch all data in parallel with a single API call each
                 const [routesData, stopsData, disruptionsData] = await Promise.all([
-                    fetch(`${API_BASE_URL}/api/PTV/routes?route_types=${routeTypesParam}&includeGeopaths=true`)
+                    authenticatedFetch(`${API_BASE_URL}/api/PTV/routes?route_types=${routeTypesParam}&includeGeopaths=true`)
                         .then(res => res.json())
                         .then(data => data.routes || []),
-                    fetch(`${API_BASE_URL}/api/PTV/stops?route_types=${routeTypesParam}`)
+                    authenticatedFetch(`${API_BASE_URL}/api/PTV/stops?route_types=${routeTypesParam}`)
                         .then(res => res.json()),
-                    fetch(`${API_BASE_URL}/api/PTV/disruptions?route_types=${routeTypesParam}`)
+                    authenticatedFetch(`${API_BASE_URL}/api/PTV/disruptions?route_types=${routeTypesParam}`)
                         .then(res => res.json())
                         .then(data => data.disruptions || [])
                 ]);
 
-                // Process routes
+                // Process routes with aggressive geopath simplification for better performance
+                const simplifyPath = (path, tolerance = 5) => {
+                    // Keep every Nth point to reduce coordinate density
+                    // This dramatically improves rendering performance
+                    if (path.length <= 10) return path;
+                    return path.filter((_, index) => index === 0 || index === path.length - 1 || index % tolerance === 0);
+                };
+
                 const allRoutes = routesData.map(r => {
                     const geopaths = r.geopaths || [];
-                    const allCoords = geopaths.map(geo =>
-                        geo
+                    const allCoords = geopaths.map(geo => {
+                        const points = geo
                             .filter(p => p.lat != null && p.lon != null)
-                            .map(p => [Number(p.lat), Number(p.lon)])
-                    );
+                            .map(p => [Number(p.lat), Number(p.lon)]);
+                        // Aggressive simplification: keep every 5th point (80% reduction)
+                        return simplifyPath(points, 5);
+                    });
                     return {
                         ...r,
                         coords: allCoords,
@@ -1449,10 +1463,10 @@ export default function MapRoutes() {
 
             {/* Map */}
             <MapContainer
-             
                 center={[-37.8136, 144.9631]}
                 zoom={12}
                 style={{ height: "100%", width: "100vw" }}
+                preferCanvas={true}
             >
                 <TileLayer
                     url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -1704,31 +1718,31 @@ export default function MapRoutes() {
 
                 {/* Draw stops */}
                 {(() => {
-                    // Filter and group stops based on zoom level for performance
-                    let stopsToRender = stops;
+                    // Different zoom thresholds for different transport types
+                    // Tram stops disappear first (zoom < 13)
+                    // Train stops disappear second (zoom < 11)
+                    // V/Line stops always visible (or zoom < 9)
 
-                    // Always group tram stops that are very close together
-                    // This prevents duplicate markers for bidirectional tram stops
+                    // Group tram stops that are very close together
                     const groupedStops = new Map();
+                    stops.forEach(s => {
+                        // Filter based on zoom level and route type
+                        if (s.route_type === 1 && zoom < 13) return; // Trams disappear first
+                        if (s.route_type === 0 && zoom < 11) return; // Trains disappear second
+                        // V/Line (route_type === 3) NEVER disappears
+                        if (s.route_type === 2 && zoom < 12) return; // Buses
 
-                    stopsToRender.forEach(s => {
-                        if (s.route_type === 1) { // Only group tram stops
-                            // Create a key based on rounded coordinates (within ~10m)
+                        if (s.route_type === 1) {
                             const key = `${Math.round(s.lat * 1000)}:${Math.round(s.lng * 1000)}`;
-
                             if (!groupedStops.has(key)) {
                                 groupedStops.set(key, s);
                             }
-                            // If duplicate, skip it (only keep first one)
                         } else {
-                            // For non-tram stops, use unique key to always include them
                             groupedStops.set(`${s.stop_id}`, s);
                         }
                     });
 
-                    stopsToRender = Array.from(groupedStops.values());
-
-                    return stopsToRender.map(s => {
+                    return Array.from(groupedStops.values()).map(s => {
                     // Check if this stop is part of the selected journey
                     const isOnPlannedRoute = plannedJourneys?.[selectedJourneyIndex]?.some(trip =>
                         trip.origin_stop_id === s.stop_id || trip.destination_stop_id === s.stop_id
@@ -1761,27 +1775,39 @@ export default function MapRoutes() {
                     const defaultFillColor = defaultFillColors[s.route_type] || "yellow";
 
                     // Size multiplier based on route_type
-                    const sizeMultiplier = s.route_type === 1 ? 0.33 :  // Tram - 1/3 of train size
-                                          s.route_type === 2 ? 0.5 :   // Bus - smaller
-                                          s.route_type === 3 ? 1.3 :   // V/Line - slightly bigger than trains
-                                          1.1;                          // Train - slightly bigger than before
+                    // All sizes significantly increased for better visibility
+                    const sizeMultiplier = s.route_type === 1 ? 0.6 :   // Tram - 60% of train size (was 33%)
+                                          s.route_type === 2 ? 0.7 :   // Bus - 70% of train size
+                                          s.route_type === 3 ? 1.5 :   // V/Line - 150% larger (regional stations)
+                                          1.0;                          // Train - base size (100%)
+
+                    // Check if this stop is the selected origin or destination
+                    const isOriginStop = s.stop_id === selectedOriginStopId;
+                    const isDestinationStop = s.stop_id === selectedDestinationStopId;
 
                     const fillColor = isActiveDisruption ? "#ff6b6b" :
                                       isUpcomingDisruption ? "#ffa502" :
                                       isOnPlannedRoute ? "#00ff00" : defaultFillColor;
 
                     // Bus stops: no border (match fill color), fixed size to prevent lag
+                    // Origin/Destination: distinctive thick outlines (blue for origin, red for destination)
                     // Other stops: black border, dynamic size based on zoom
-                    const color = isActiveDisruption ? "#ff6b6b" :
+                    const color = isOriginStop ? "#0066ff" :  // Bright blue for origin
+                                  isDestinationStop ? "#ff0066" :  // Bright red for destination
+                                  isActiveDisruption ? "#ff6b6b" :
                                   isUpcomingDisruption ? "#ffa502" :
                                   isOnPlannedRoute ? "#00ff00" :
                                   s.route_type === 2 ? fillColor : "black";
 
-                    // Bus stops: fixed 30m radius to prevent lag
-                    // V/Line stops: use getVLineRadius() for consistent visual size (3x larger than normal)
-                    // Other stops: scale dynamically with zoom
-                    const baseRadius = s.route_type === 2 ? 30 :
-                                      s.route_type === 3 ? getVLineRadius(zoom) :
+                    // Origin/Destination: thicker border weight for visibility
+                    const weight = isOriginStop || isDestinationStop ? 4 :
+                                   s.route_type === 1 ? 0.5 : 1;
+
+                    // Bus stops: fixed 40m radius to prevent lag (increased from 30m for visibility)
+                    // Origin/Destination: fixed larger radius (80m) to ensure they're always visible at any zoom
+                    // All other stops: scale dynamically with zoom using getRadius() * sizeMultiplier
+                    const baseRadius = s.route_type === 2 ? 40 :
+                                      isOriginStop || isDestinationStop ? 80 :
                                       (getRadius(zoom) * sizeMultiplier);
                     const radius = isOnPlannedRoute ? baseRadius * 1.5 : baseRadius;
 
@@ -1791,7 +1817,7 @@ export default function MapRoutes() {
                             center={[s.lat, s.lng]}
                             radius={radius}
                             color={color}
-                            weight={s.route_type === 1 ? 0.5 : 1}
+                            weight={weight}
                             fillColor={fillColor}
                             fillOpacity={1.0}
                             pane="markerPane"
@@ -1801,6 +1827,16 @@ export default function MapRoutes() {
                                     <strong>{s.stop_name}</strong><br />
                                     {s.stop_suburb && <span>{s.stop_suburb}<br /></span>}
                                     {s.stop_landmark && <span>{s.stop_landmark}</span>}
+                                    {isOriginStop && (
+                                        <span style={{ color: '#0066ff', fontWeight: 'bold' }}>
+                                            <br />📍 Origin Station
+                                        </span>
+                                    )}
+                                    {isDestinationStop && (
+                                        <span style={{ color: '#ff0066', fontWeight: 'bold' }}>
+                                            <br />🎯 Destination Station
+                                        </span>
+                                    )}
                                     {isActiveDisruption && (
                                         <span style={{ color: '#ff6b6b', fontWeight: 'bold' }}>
                                             <br />⚠ Active Disruption

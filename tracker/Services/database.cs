@@ -15,9 +15,16 @@ namespace PTVApp.Services
 
         public DatabaseService(IConfiguration config)
         {
-            // Basic connection setup
-            _connectionString = "Host=localhost;Port=5432;Username=postgres;Password=password;Database=tracker";
             _config = config;
+
+            // Build connection string from configuration
+            var host = config["Database:Host"] ?? "localhost";
+            var port = config.GetValue<int>("Database:Port", 5432);
+            var username = config["Database:Username"] ?? "postgres";
+            var password = config["Database:Password"] ?? "password";
+            var database = config["Database:Database"] ?? "tracker";
+
+            _connectionString = $"Host={host};Port={port};Username={username};Password={password};Database={database}";
         }
 
         public async Task UpdateValues()
@@ -178,27 +185,44 @@ namespace PTVApp.Services
 
             await reader.CloseAsync();
 
-            // Optionally fetch geopaths for each route
+            // Optionally fetch geopaths for each route (parallelized with throttling)
             if (includeGeopaths)
             {
-                foreach (var route in routes)
+                // Use parallel processing with limited concurrency to avoid overwhelming the connection pool
+                var semaphore = new System.Threading.SemaphoreSlim(10); // Max 10 concurrent queries
+                var geopathTasks = routes.Select(async route =>
                 {
-                    // First try GTFS patterns
-                    var patterns = await GetAllRoutePatternsFromGtfs(conn, route.RouteGtfsId, route.RouteType);
-                    if (patterns.Count > 0)
+                    await semaphore.WaitAsync();
+                    try
                     {
-                        route.GeoPaths = patterns.Select(p => p.GeoPath).ToList();
-                    }
-                    else
-                    {
-                        // Fallback: check if route has stored geopath (e.g., from OSRM for coach routes)
-                        var geopath = await GetStoredGeopath(conn, route.RouteGtfsId);
-                        if (geopath != null && geopath.Count > 0)
+                        await using var routeConn = new NpgsqlConnection(_connectionString);
+                        await routeConn.OpenAsync();
+
+                        // First try GTFS patterns
+                        var patterns = await GetAllRoutePatternsFromGtfs(routeConn, route.RouteGtfsId, route.RouteType);
+                        if (patterns.Count > 0)
                         {
-                            route.GeoPaths = new List<List<GeoPoint>> { geopath };
+                            route.GeoPaths = patterns.Select(p => p.GeoPath).ToList();
                         }
+                        else
+                        {
+                            // Fallback: check if route has stored geopath (e.g., from OSRM for coach routes)
+                            var geopath = await GetStoredGeopath(routeConn, route.RouteGtfsId);
+                            if (geopath != null && geopath.Count > 0)
+                            {
+                                route.GeoPaths = new List<List<GeoPoint>> { geopath };
+                            }
+                        }
+
+                        await routeConn.CloseAsync();
                     }
-                }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                }).ToList();
+
+                await Task.WhenAll(geopathTasks);
             }
 
             await conn.CloseAsync();
