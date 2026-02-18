@@ -4,6 +4,7 @@ using Npgsql;
 using PTVApp.Models;
 using PTVApp.Services;
 using System.Reflection.Metadata;
+using System.Text.Json;
 using System.Threading.Tasks;
 
 namespace PTVApp.Controllers
@@ -169,6 +170,56 @@ namespace PTVApp.Controllers
             return Ok(routeResponse);
         }
 
+        // --- Helpers for realtime departure lookup ---
+
+        private List<DateTime> ParseDepartures(string json)
+        {
+            try
+            {
+                var response = JsonSerializer.Deserialize<DeparturesResponse>(json);
+                if (response?.Departures == null) return [];
+                var times = response.Departures
+                    .Select(d => d.EstimatedDepartureUtc ?? d.ScheduledDepartureUtc)
+                    .Where(d => d.HasValue)
+                    .Select(d => d!.Value)
+                    .OrderBy(d => d)
+                    .ToList();
+                return times;
+            }
+            catch
+            {
+                return [];
+            }
+        }
+
+        private async Task<DateTime?> GetNextDeparture(int routeType, int stopId, int routeId, DateTime afterTime)
+        {
+            try
+            {
+                var json = await _ptvClient.GetDeparturesForRoute(routeType, stopId, routeId, maxResults: 2, afterTime: afterTime);
+                var times = ParseDepartures(json);
+                // Use Cast to get DateTime? so FirstOrDefault returns null (not DateTime.MinValue) when empty
+                return times.Where(t => t >= afterTime).Cast<DateTime?>().FirstOrDefault();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private async Task<List<DateTime>> GetUpcomingDepartures(int routeType, int stopId, int routeId, int count)
+        {
+            try
+            {
+                var json = await _ptvClient.GetDeparturesForRoute(routeType, stopId, routeId, maxResults: count);
+                return ParseDepartures(json);
+            }
+            catch
+            {
+                return [];
+            }
+        }
+
         [HttpGet("tripPlan/{originStopId}/{destinationStopId}")]
         public async Task<ActionResult<TripResponse>> GetTripPlan(
             int originStopId,
@@ -179,9 +230,11 @@ namespace PTVApp.Controllers
         {
             try
             {
-                var (trips, journeys) = await _database.PlanTripDijkstra(originStopId, destinationStopId, k, includeReplacementBuses);
+                int internalK = Math.Max(k * 2, 6);
+                var (_, journeys, legMinutesList) = await _database.PlanTripDijkstra(
+                    originStopId, destinationStopId, internalK, includeReplacementBuses);
 
-                if (trips == null || journeys == null)
+                if (journeys == null || journeys.Count == 0 || legMinutesList == null)
                 {
                     return NotFound(new TripResponse
                     {
@@ -191,11 +244,106 @@ namespace PTVApp.Controllers
                     });
                 }
 
+                var utcNow = DateTime.UtcNow;
+                var candidates = new List<(List<Trip> Legs, DateTime Arrival, double WaitMins)>();
+
+                for (int ji = 0; ji < journeys.Count && ji < legMinutesList.Count; ji++)
+                {
+                    var journey = journeys[ji];
+                    var legMins = legMinutesList[ji];
+                    if (journey.Count == 0) continue;
+
+                    var firstLeg = journey[0];
+                    int ptvFirstRouteId = firstLeg.PtvRouteId ?? (firstLeg.RouteId > 10000 ? firstLeg.RouteId / 1000 : firstLeg.RouteId);
+
+                    var leg1Deps = await GetUpcomingDepartures(firstLeg.RouteType, originStopId, ptvFirstRouteId, count: 4);
+
+                    foreach (var dep1 in leg1Deps.Where(d => d >= utcNow))
+                    {
+                        var current = dep1;
+                        var legsCopy = journey.Select(t => new Trip
+                        {
+                            TripId = t.TripId,
+                            OriginStopId = t.OriginStopId,
+                            DestinationStopId = t.DestinationStopId,
+                            DepartureTime = t.DepartureTime,
+                            ArrivalTime = t.ArrivalTime,
+                            RouteId = t.RouteId,
+                            RouteName = t.RouteName,
+                            RouteNumber = t.RouteNumber,
+                            RouteType = t.RouteType,
+                            RouteColour = t.RouteColour,
+                            GeoPath = t.GeoPath,
+                            TravelMinutes = t.TravelMinutes,
+                            PtvRouteId = t.PtvRouteId
+                        }).ToList();
+                        bool valid = true;
+
+                        for (int li = 0; li < legsCopy.Count; li++)
+                        {
+                            var leg = legsCopy[li];
+                            int ptvRouteId = leg.PtvRouteId ?? (leg.RouteId > 10000 ? leg.RouteId / 1000 : leg.RouteId);
+                            double legTravelMins = li < legMins.Count ? legMins[li] : (leg.TravelMinutes ?? 10);
+
+                            DateTime departure;
+                            if (li == 0)
+                            {
+                                departure = dep1;
+                            }
+                            else
+                            {
+                                var nextDep = await GetNextDeparture(leg.RouteType, leg.OriginStopId, ptvRouteId, current);
+                                if (nextDep == null) { valid = false; break; }
+                                departure = nextDep.Value;
+                            }
+
+                            var arrival = departure + TimeSpan.FromMinutes(legTravelMins);
+                            leg.DepartureTime = departure.ToLocalTime();
+                            leg.ArrivalTime = arrival.ToLocalTime();
+                            current = arrival;
+                        }
+
+                        if (valid)
+                        {
+                            double waitMins = (dep1 - utcNow).TotalMinutes;
+                            candidates.Add((legsCopy, current, waitMins));
+                        }
+                    }
+                }
+
+                // Rank by arrival time at destination, take top k
+                var top = candidates.OrderBy(c => c.Arrival).Take(k).ToList();
+
+                // If no realtime candidates, fall back to static journeys
+                if (top.Count == 0)
+                {
+                    Console.WriteLine("[TripPlan] No realtime candidates — returning static journeys");
+                    var staticTrips = journeys.Take(k).SelectMany(j => j).ToList();
+                    return Ok(new TripResponse
+                    {
+                        Status = _defaultStatus,
+                        Trips = staticTrips,
+                        Journeys = journeys.Take(k).ToList()
+                    });
+                }
+
+                // Annotate first leg of each result with wait/total minutes
+                foreach (var (legs, arrival, waitMins) in top)
+                {
+                    legs[0].WaitMinutes = (int)Math.Max(0, waitMins);
+                    // TotalMinutes = wait until first departure + sum of all leg travel times
+                    double totalTravelMins = legs.Sum(leg => (double)(leg.TravelMinutes ?? 0));
+                    legs[0].TotalMinutes = (int)Math.Round(Math.Max(0, waitMins) + totalTravelMins);
+                }
+
+                var resultJourneys = top.Select(c => c.Legs).ToList();
+                var resultTrips = resultJourneys.SelectMany(j => j).ToList();
+
                 return Ok(new TripResponse
                 {
                     Status = _defaultStatus,
-                    Trips = trips,
-                    Journeys = journeys
+                    Trips = resultTrips,
+                    Journeys = resultJourneys
                 });
             }
             catch (Exception ex)
@@ -256,7 +404,7 @@ namespace PTVApp.Controllers
                 }
 
                 // Get the graph-based routes (fastest paths)
-                var (trips, journeys) = await _database.PlanTripDijkstra(originStopId, destinationStopId, k, includeReplacementBuses);
+                var (trips, journeys, _) = await _database.PlanTripDijkstra(originStopId, destinationStopId, k, includeReplacementBuses);
 
                 if (trips == null || journeys == null || journeys.Count == 0)
                 {

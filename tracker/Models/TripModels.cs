@@ -47,6 +47,19 @@ namespace PTVApp.Models
 
         [JsonPropertyName("geopath")]
         public List<GeoPoint> GeoPath {get; set;} = [];
+
+        [JsonPropertyName("wait_minutes")]
+        public int? WaitMinutes { get; set; }
+
+        [JsonPropertyName("travel_minutes")]
+        public int? TravelMinutes { get; set; }
+
+        [JsonPropertyName("total_minutes")]
+        public int? TotalMinutes { get; set; }
+
+        // PTV API route ID (may differ from internal RouteId, especially for trams)
+        [JsonPropertyName("ptv_route_id")]
+        public int? PtvRouteId { get; set; }
     }
 
 }

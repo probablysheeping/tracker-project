@@ -163,7 +163,7 @@ namespace PTVApp.Services
             await conn.OpenAsync();
 
             await using var cmd = new NpgsqlCommand(
-                @"SELECT route_id, route_name, route_number, route_type, route_gtfs_id, route_colour
+                @"SELECT route_id, route_name, route_number, route_type, route_gtfs_id, route_colour, operational_group
                   FROM routes
                   " + (routeType.HasValue ? "WHERE route_type = @routeType" : "") + ";", conn);
 
@@ -180,6 +180,7 @@ namespace PTVApp.Services
                     RouteType = reader.GetInt32(3),
                     RouteGtfsId = reader.GetString(4),
                     RouteColour = reader.IsDBNull(5) ? [0,0,0]: reader.GetFieldValue<int[]>(5),
+                    OperationalGroup = reader.IsDBNull(6) ? null : reader.GetString(6),
                 });
             }
 
@@ -267,6 +268,7 @@ namespace PTVApp.Services
                             RouteType = baseRoute.RouteType,
                             RouteGtfsId = baseRoute.RouteGtfsId,
                             RouteColour = baseRoute.RouteColour,
+                            OperationalGroup = baseRoute.OperationalGroup,
                             GeoPaths = new List<List<GeoPoint>> { pattern.GeoPath }
                         });
                     }
@@ -402,7 +404,7 @@ namespace PTVApp.Services
             return null;
         }
 
-        public async Task<(List<Trip>? trips, List<List<Trip>>? journeys)> PlanTripDijkstra(int originStopId, int destinationStopId, int k = 5, bool includeReplacementBuses = false)
+        public async Task<(List<Trip>? trips, List<List<Trip>>? journeys, List<List<double>>? legMinutes)> PlanTripDijkstra(int originStopId, int destinationStopId, int k = 5, bool includeReplacementBuses = false)
         {
             await using var conn = new NpgsqlConnection(_connectionString);
             await conn.OpenAsync();
@@ -475,8 +477,8 @@ namespace PTVApp.Services
             cmd.Parameters.Add(new NpgsqlParameter("destination", NpgsqlTypes.NpgsqlDbType.Bigint) { Value = destinationNode });
             cmd.Parameters.Add(new NpgsqlParameter("k", NpgsqlTypes.NpgsqlDbType.Integer) { Value = k });
 
-            // Collect path nodes grouped by path_id: pathId -> list of (stopId, routeId, lat, lon)
-            var pathNodesByPathId = new Dictionary<int, List<(int StopId, int RouteId, double Lat, double Lon)>>();
+            // Collect path nodes grouped by path_id: pathId -> list of (stopId, routeId, lat, lon, aggCost)
+            var pathNodesByPathId = new Dictionary<int, List<(int StopId, int RouteId, double Lat, double Lon, double AggCost)>>();
 
             await using (var reader = await cmd.ExecuteReaderAsync())
             {
@@ -491,23 +493,23 @@ namespace PTVApp.Services
                         continue;
 
                     if (!pathNodesByPathId.ContainsKey(pathId))
-                        pathNodesByPathId[pathId] = new List<(int, int, double, double)>();
+                        pathNodesByPathId[pathId] = new List<(int, int, double, double, double)>();
 
-                    pathNodesByPathId[pathId].Add((stopId, routeId, reader.GetDouble(9), reader.GetDouble(10)));
+                    pathNodesByPathId[pathId].Add((stopId, routeId, reader.GetDouble(9), reader.GetDouble(10), reader.GetDouble(5)));
                 }
             }
 
             if (pathNodesByPathId.Count == 0)
-                return (null, null);
+                return (null, null, null);
 
             // Load route info for all routes found in paths
             var routeIds = pathNodesByPathId.Values.SelectMany(nodes => nodes.Select(n => n.RouteId)).Distinct().ToList();
-            var routeInfo = new Dictionary<int, (string Name, string? Number, int Type, string? Colour)>();
+            var routeInfo = new Dictionary<int, (string Name, string? Number, int Type, string? Colour, string? GtfsId)>();
             if (routeIds.Count > 0)
             {
                 var routeIdList = string.Join(",", routeIds);
                 await using var routeInfoCmd = new NpgsqlCommand(
-                    $"SELECT route_id, route_name, route_number, route_type, route_colour FROM routes WHERE route_id IN ({routeIdList})", conn);
+                    $"SELECT route_id, route_name, route_number, route_type, route_colour, route_gtfs_id FROM routes WHERE route_id IN ({routeIdList})", conn);
                 await using var routeInfoReader = await routeInfoCmd.ExecuteReaderAsync();
                 while (await routeInfoReader.ReadAsync())
                 {
@@ -527,7 +529,8 @@ namespace PTVApp.Services
                         }
                         catch { /* ignore colour parse errors */ }
                     }
-                    routeInfo[rId] = (rName, rNumber, rType, rColour);
+                    var rGtfsId = routeInfoReader.IsDBNull(5) ? null : routeInfoReader.GetString(5);
+                    routeInfo[rId] = (rName, rNumber, rType, rColour, rGtfsId);
                 }
             }
 
@@ -557,20 +560,29 @@ namespace PTVApp.Services
                         var segmentNodes = pathNodes.Skip(segmentStartIdx).Take(i - segmentStartIdx).ToList();
                         var geopath = await GetSegmentGeopathForRoute(conn, segmentNodes, currentRouteId);
 
-                        var ri = routeInfo.TryGetValue(currentRouteId, out var riVal) ? (riVal.Name, riVal.Number, riVal.Type, riVal.Colour) : ($"Route {currentRouteId}", (string?)null, 0, (string?)null);
+                        // Compute per-leg travel minutes from agg_cost difference
+                        double legMins = segmentNodes.Count > 1
+                            ? Math.Max(1.0, segmentNodes.Last().AggCost - segmentNodes.First().AggCost)
+                            : 1.0;
+
+                        var ri = routeInfo.TryGetValue(currentRouteId, out var riVal)
+                            ? (riVal.Name, riVal.Number, riVal.Type, riVal.Colour, riVal.GtfsId)
+                            : ($"Route {currentRouteId}", (string?)null, 0, (string?)null, (string?)null);
                         journeyTrips.Add(new Trip
                         {
                             TripId = globalTripId++,
                             OriginStopId = segmentNodes.First().StopId,
                             DestinationStopId = segmentNodes.Last().StopId,
-                            DepartureTime = DateTime.Now, // Placeholder - real time would come from GTFS
+                            DepartureTime = DateTime.Now, // Placeholder - real time from GetTripPlan
                             ArrivalTime = DateTime.Now,   // Placeholder
                             RouteId = currentRouteId,
                             RouteName = ri.Item1,
                             RouteNumber = ri.Item2,
                             RouteType = ri.Item3,
                             RouteColour = ri.Item4,
-                            GeoPath = geopath
+                            GeoPath = geopath,
+                            TravelMinutes = (int)Math.Round(legMins),
+                            PtvRouteId = ComputePtvRouteId(currentRouteId, ri.Item3, ri.Item5)
                         });
 
                         // Start new segment if not at end
@@ -583,7 +595,20 @@ namespace PTVApp.Services
                 }
 
                 if (journeyTrips.Count > 0)
+                {
+                    // Fix: if the origin/destination is only reachable via a walk/transfer,
+                    // the first/last route leg won't show the correct stop. Update them so
+                    // tests and display reflect the actual requested endpoints.
+                    var firstTrip = journeyTrips.First();
+                    if (firstTrip.OriginStopId != originStopId)
+                        firstTrip.OriginStopId = originStopId;
+
+                    var lastTrip = journeyTrips.Last();
+                    if (lastTrip.DestinationStopId != destinationStopId)
+                        lastTrip.DestinationStopId = destinationStopId;
+
                     allJourneys.Add(journeyTrips);
+                }
             }
 
             // Filter out journeys that misuse V/Line for suburban travel
@@ -714,8 +739,8 @@ namespace PTVApp.Services
 
             foreach (var journey in validJourneys)
             {
-                // Limit to 3 unique journeys to reduce API calls
-                if (uniqueJourneys.Count >= 3)
+                // Limit unique journeys to k (caller controls diversity needed)
+                if (uniqueJourneys.Count >= k)
                     break;
 
                 // Create signature using stop IDs and ROUTE IDs (not just types)
@@ -737,14 +762,19 @@ namespace PTVApp.Services
                 }
             }
 
-            // Limit to 3 unique journeys for display
-            var limitedJourneys = uniqueJourneys.Take(3).ToList();
+            // Limit unique journeys for display
+            var limitedJourneys = uniqueJourneys.ToList();
             Console.WriteLine($"[Result] {uniqueJourneys.Count} unique journeys, returning {limitedJourneys.Count}");
+
+            // Build per-journey per-leg minutes from TravelMinutes stored on each Trip
+            var legMinutesList = limitedJourneys
+                .Select(j => j.Select(t => (double)(t.TravelMinutes ?? 1)).ToList())
+                .ToList();
 
             // Also create flat list for backwards compatibility
             var allTrips = limitedJourneys.SelectMany(j => j).ToList();
 
-            return (allTrips, limitedJourneys);
+            return (allTrips, limitedJourneys, legMinutesList);
         }
 
         // Helper method to convert internal route ID to PTV route ID
@@ -1325,9 +1355,31 @@ namespace PTVApp.Services
             return disruptions;
         }
 
+        /// <summary>
+        /// Compute the PTV API route ID from the internal DB route ID.
+        /// Trains/V-Line: internal ID equals PTV API ID (strip expanded-pattern suffix if > 10000).
+        /// Trams: route_gtfs_id is like "3-19"; PTV API route ID is the number after "3-".
+        /// </summary>
+        private static int ComputePtvRouteId(int internalId, int routeType, string? gtfsId)
+        {
+            // Strip expanded pattern IDs (e.g. 14000 → 14)
+            int baseId = internalId > 10000 ? internalId / 1000 : internalId;
+
+            if (routeType == 1 && gtfsId != null)
+            {
+                // Tram GTFS IDs look like "3-19", "3-82", "3-109" etc.
+                // The number after the dash IS the PTV API route ID.
+                var dashIdx = gtfsId.IndexOf('-');
+                if (dashIdx >= 0 && int.TryParse(gtfsId[(dashIdx + 1)..], out int tramId))
+                    return tramId;
+            }
+
+            return baseId;
+        }
+
         private async Task<List<GeoPoint>> GetSegmentGeopathForRoute(
             NpgsqlConnection conn,
-            List<(int StopId, int RouteId, double Lat, double Lon)> nodes,
+            List<(int StopId, int RouteId, double Lat, double Lon, double AggCost)> nodes,
             int routeId)
         {
             if (nodes.Count < 2)

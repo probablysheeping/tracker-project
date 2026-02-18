@@ -49,6 +49,9 @@ namespace PTVApp.Models
 
         [JsonPropertyName("patterns")]
         public List<RoutePattern> Patterns { get; set; } = [];
+
+        [JsonPropertyName("operational_group")]
+        public string? OperationalGroup { get; set; }
     }
 
     public class RouteSendResponse : RouteResponse

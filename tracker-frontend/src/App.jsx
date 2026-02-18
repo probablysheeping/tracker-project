@@ -943,9 +943,11 @@ export default function MapRoutes() {
                                                     // Calculate total journey time and departure time
                                                     const firstTrip = journey[0];
                                                     const lastTrip = journey[journey.length - 1];
-                                                    const totalMinutes = firstTrip?.departure_time && lastTrip?.arrival_time
+                                                    const computedTotalMinutes = firstTrip?.departure_time && lastTrip?.arrival_time
                                                         ? Math.round((new Date(lastTrip.arrival_time) - new Date(firstTrip.departure_time)) / 60000)
                                                         : null;
+                                                    // Prefer backend-supplied total_minutes, fall back to computed
+                                                    const displayTotalMinutes = firstTrip?.total_minutes ?? computedTotalMinutes;
                                                     const departTime = firstTrip?.departure_time
                                                         ? new Date(firstTrip.departure_time).toLocaleTimeString('en-AU', {
                                                             hour: '2-digit',
@@ -989,6 +991,11 @@ export default function MapRoutes() {
                                                             }
                                                         }}
                                                         >
+                                                            {firstTrip?.wait_minutes != null && (
+                                                                <div style={{ fontSize: "0.65rem", color: "#90ee90", marginBottom: "0.1rem" }}>
+                                                                    Departs in {firstTrip.wait_minutes} min
+                                                                </div>
+                                                            )}
                                                             {departTime && (
                                                                 <div style={{ fontWeight: "700", fontSize: "0.85rem", color: "#ffd700" }}>
                                                                     {departTime}
@@ -996,9 +1003,9 @@ export default function MapRoutes() {
                                                             )}
                                                             <div style={{ fontSize: "0.7rem", opacity: 0.8, marginTop: "0.25rem" }}>
                                                                 {journey.length} leg{journey.length > 1 ? 's' : ''}
-                                                                {totalMinutes && (
+                                                                {displayTotalMinutes != null && (
                                                                     <span style={{ marginLeft: "0.25rem", fontWeight: "600", color: "#fff" }}>
-                                                                        • {totalMinutes} min
+                                                                        • ~{displayTotalMinutes} min
                                                                     </span>
                                                                 )}
                                                             </div>
@@ -1687,13 +1694,15 @@ export default function MapRoutes() {
                     // Use consistent bright cyan for planned trips, red if disrupted
                     const tripColor = isActiveDisruption ? "#ff0000" : "#00d4ff";
 
+                    const tripLineWeight = Math.max(3, zoom - 6);
+
                     return (
                         <React.Fragment key={`trip-${trip.trip_id}`}>
                             {/* White outline for better visibility - render first (bottom) */}
                             <Polyline
                                 positions={geopath.map(p => [p.lat, p.lon])}
                                 color="white"
-                                weight={9}
+                                weight={tripLineWeight + 2}
                                 opacity={0.4}
                                 pane="overlayPane"
                             />
@@ -1702,7 +1711,7 @@ export default function MapRoutes() {
                             <Polyline
                                 positions={geopath.map(p => [p.lat, p.lon])}
                                 color={tripColor}
-                                weight={7}
+                                weight={tripLineWeight}
                                 opacity={0.9}
                                 pane="overlayPane"
                             />
@@ -1748,7 +1757,9 @@ export default function MapRoutes() {
                         }
                     });
 
-                    return Array.from(groupedStops.values()).map(s => {
+                    return Array.from(groupedStops.values())
+                        .sort((a, b) => (a.route_type === 3 ? 1 : 0) - (b.route_type === 3 ? 1 : 0))
+                        .map(s => {
                     // Check if this stop is part of the selected journey
                     const isOnPlannedRoute = plannedJourneys?.[selectedJourneyIndex]?.some(trip =>
                         trip.origin_stop_id === s.stop_id || trip.destination_stop_id === s.stop_id
@@ -1784,7 +1795,7 @@ export default function MapRoutes() {
                     // All sizes significantly increased for better visibility
                     const sizeMultiplier = s.route_type === 1 ? 0.3 :   // Tram - 30% of train size (halved from 60%)
                                           s.route_type === 2 ? 0.7 :   // Bus - 70% of train size
-                                          s.route_type === 3 ? 1.5 :   // V/Line - 150% larger (regional stations)
+                                          s.route_type === 3 ? 0.75 :  // V/Line - 75% of train size (half of previous 150%)
                                           0.6;                          // Train - 60% of original size
 
                     // Check if this stop is the selected origin or destination
@@ -1810,10 +1821,10 @@ export default function MapRoutes() {
                                    s.route_type === 1 ? 0.5 : 1;
 
                     // Bus stops: fixed 40m radius to prevent lag (increased from 30m for visibility)
-                    // Origin/Destination: fixed larger radius (80m) to ensure they're always visible at any zoom
+                    // Origin/Destination: zoom-scaled radius (2× normal size) so they stay proportionate
                     // All other stops: scale dynamically with zoom using getRadius() * sizeMultiplier
                     const baseRadius = s.route_type === 2 ? 40 :
-                                      isOriginStop || isDestinationStop ? 80 :
+                                      isOriginStop || isDestinationStop ? (getRadius(zoom) * sizeMultiplier * 2) :
                                       (getRadius(zoom) * sizeMultiplier);
                     const radius = isOnPlannedRoute ? baseRadius * 1.5 : baseRadius;
 

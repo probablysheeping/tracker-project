@@ -170,7 +170,7 @@ public class DatabaseServiceTests
         int k = 3;
 
         // Act
-        var (trips, journeys) = await dbService.PlanTripDijkstra(originStopId, destinationStopId, k);
+        var (trips, journeys, _) = await dbService.PlanTripDijkstra(originStopId, destinationStopId, k);
 
         // Assert
         Assert.NotNull(trips);

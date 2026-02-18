@@ -137,9 +137,13 @@ namespace PTVApp.Services {
         }
 
         // Get departures from a specific stop on a specific route
-        public async Task<string> GetDeparturesForRoute(int routeType, int stopId, int routeId, int maxResults = 10)
+        public async Task<string> GetDeparturesForRoute(int routeType, int stopId, int routeId, int maxResults = 10, DateTime? afterTime = null)
         {
-            return await CallApi($"/v3/departures/route_type/{routeType}/stop/{stopId}/route/{routeId}?max_results={maxResults}&expand=run&expand=route&expand=stop");
+            string dateParam = afterTime.HasValue
+                ? $"&date_utc={Uri.EscapeDataString(afterTime.Value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))}"
+                : "";
+            return await CallApi(
+                $"/v3/departures/route_type/{routeType}/stop/{stopId}/route/{routeId}?max_results={maxResults}&expand=run&expand=route&expand=stop{dateParam}");
         }
 
         // Get departures from a stop (all routes)
