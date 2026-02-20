@@ -1,0 +1,13 @@
+{
+  "recommendations": [
+    "ms-dotnettools.csharp",
+    "ms-dotnettools.csdevkit",
+    "esbenp.prettier-vscode",
+    "dbaeumer.vscode-eslint",
+    "dsznajder.es7-react-js-snippets",
+    "formulahendry.auto-rename-tag",
+    "humao.rest-client",
+    "ms-azuretools.vscode-docker",
+    "eamodio.gitlens"
+  ]
+}
