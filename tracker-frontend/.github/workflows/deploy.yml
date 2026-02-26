@@ -36,9 +36,9 @@ jobs:
       - name: Build
         run: npm run build
         env:
-          # This uses the repository secret VITE_API_URL
-          # Set this in: GitHub repo → Settings → Secrets and variables → Actions
+          # Set these in: GitHub repo → Settings → Secrets and variables → Actions
           VITE_API_URL: ${{ secrets.VITE_API_URL }}
+          VITE_API_KEY: ${{ secrets.VITE_API_KEY }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v4

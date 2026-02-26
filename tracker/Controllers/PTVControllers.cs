@@ -21,13 +21,13 @@ namespace PTVApp.Controllers
             };
         private readonly DatabaseService _database;
 
-        public PTVController(IConfiguration configuration)
+        public PTVController(IConfiguration configuration, RoutingGraph routingGraph)
         {
             string? apiKey = configuration["api-key"];
             string? devId = configuration["user-id"];
             if (apiKey is null || devId is null) throw new Exception("ApiKey or UserID is null\n");
             _ptvClient = new PTVClient(devId, apiKey);
-            _database = new DatabaseService(configuration);
+            _database = new DatabaseService(configuration, routingGraph);
         }
         [HttpGet("routes")]
         public async Task<ActionResult<RouteSendResponse>> GetRoutes(

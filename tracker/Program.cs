@@ -13,11 +13,34 @@ namespace PTVApp.Program
         {
             var builder = WebApplication.CreateBuilder(args);
             builder.Configuration.AddUserSecrets<Program>();
+
+            // Map environment variables for cloud deployment (Railway, Supabase, etc.)
+            // PTV_API_KEY, PTV_USER_ID → used for PTV Timetable API authentication
+            // FRONTEND_API_KEY → used for the app's own frontend auth (set in GitHub Actions secret)
+            var envOverrides = new Dictionary<string, string?>();
+            var ptvApiKey = Environment.GetEnvironmentVariable("PTV_API_KEY");
+            var ptvUserId = Environment.GetEnvironmentVariable("PTV_USER_ID");
+            var frontendApiKey = Environment.GetEnvironmentVariable("FRONTEND_API_KEY");
+            if (!string.IsNullOrEmpty(ptvApiKey)) envOverrides["api-key"] = ptvApiKey;
+            if (!string.IsNullOrEmpty(ptvUserId)) envOverrides["user-id"] = ptvUserId;
+            if (!string.IsNullOrEmpty(frontendApiKey))
+            {
+                // Override the production API key from environment
+                envOverrides["ApiVerification:ApiUsers:0:ApiKey"] = frontendApiKey;
+                envOverrides["ApiVerification:EnableApiKeyAuth"] = "true";
+            }
+            if (envOverrides.Count > 0)
+                builder.Configuration.AddInMemoryCollection(envOverrides);
             var database = new DatabaseService(builder.Configuration);
 
             await database.UpdateValues();
 
+            // Build routing graph in memory (replaces pgRouting dependency)
+            var routingGraph = new RoutingGraph();
+            await routingGraph.LoadFromConfig(builder.Configuration);
+
             // Add services to the container.
+            builder.Services.AddSingleton(routingGraph);
             builder.Services.AddControllers();
             builder.Services.AddEndpointsApiExplorer();
             builder.Services.AddSwaggerGen();

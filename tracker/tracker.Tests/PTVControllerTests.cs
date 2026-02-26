@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
 using PTVApp.Controllers;
 using PTVApp.Models;
+using PTVApp.Services;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using System.Linq;
@@ -25,7 +26,7 @@ public class PTVControllerTests
             .AddInMemoryCollection(inMemorySettings!)
             .Build();
 
-        _controller = new PTVController(configuration);
+        _controller = new PTVController(configuration, new RoutingGraph());
     }
 
     [Fact]
@@ -279,7 +280,7 @@ public class PTVControllerTests
         var emptyConfig = new ConfigurationBuilder().Build();
 
         // Act & Assert
-        var exception = Assert.Throws<Exception>(() => new PTVController(emptyConfig));
+        var exception = Assert.Throws<Exception>(() => new PTVController(emptyConfig, new RoutingGraph()));
         Assert.Contains("ApiKey or UserID is null", exception.Message);
     }
 }

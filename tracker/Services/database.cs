@@ -12,19 +12,37 @@ namespace PTVApp.Services
     {
         private readonly string _connectionString;
         private readonly IConfiguration _config;
+        private RoutingGraph? _routingGraph;
 
-        public DatabaseService(IConfiguration config)
+        public DatabaseService(IConfiguration config, RoutingGraph? routingGraph = null)
         {
             _config = config;
+            _routingGraph = routingGraph;
 
-            // Build connection string from configuration
-            var host = config["Database:Host"] ?? "localhost";
-            var port = config.GetValue<int>("Database:Port", 5432);
-            var username = config["Database:Username"] ?? "postgres";
-            var password = config["Database:Password"] ?? "password";
-            var database = config["Database:Database"] ?? "tracker";
+            // Support DATABASE_URL env var (Railway/Supabase format) or individual settings
+            var databaseUrl = Environment.GetEnvironmentVariable("DATABASE_URL");
+            if (!string.IsNullOrEmpty(databaseUrl))
+            {
+                // Convert postgres://user:pass@host:port/dbname to Npgsql format
+                _connectionString = ConvertDatabaseUrl(databaseUrl);
+            }
+            else
+            {
+                var host = config["Database:Host"] ?? "localhost";
+                var port = config.GetValue<int>("Database:Port", 5432);
+                var username = config["Database:Username"] ?? "postgres";
+                var password = config["Database:Password"] ?? "password";
+                var database = config["Database:Database"] ?? "tracker";
+                _connectionString = $"Host={host};Port={port};Username={username};Password={password};Database={database}";
+            }
+        }
 
-            _connectionString = $"Host={host};Port={port};Username={username};Password={password};Database={database}";
+        private static string ConvertDatabaseUrl(string url)
+        {
+            // postgres://user:password@host:port/database
+            var uri = new Uri(url);
+            var userInfo = uri.UserInfo.Split(':');
+            return $"Host={uri.Host};Port={uri.Port};Username={userInfo[0]};Password={Uri.UnescapeDataString(userInfo[1])};Database={uri.AbsolutePath.TrimStart('/')};SSL Mode=Require;Trust Server Certificate=true";
         }
 
         public async Task UpdateValues()
@@ -199,20 +217,22 @@ namespace PTVApp.Services
                         await using var routeConn = new NpgsqlConnection(_connectionString);
                         await routeConn.OpenAsync();
 
-                        // First try GTFS patterns
-                        var patterns = await GetAllRoutePatternsFromGtfs(routeConn, route.RouteGtfsId, route.RouteType);
-                        if (patterns.Count > 0)
+                        // Try stored geopath first (works without GTFS tables)
+                        var storedGeo = await GetStoredGeopath(routeConn, route.RouteGtfsId);
+                        if (storedGeo != null && storedGeo.Count > 0)
                         {
-                            route.GeoPaths = patterns.Select(p => p.GeoPath).ToList();
+                            route.GeoPaths = new List<List<GeoPoint>> { storedGeo };
                         }
                         else
                         {
-                            // Fallback: check if route has stored geopath (e.g., from OSRM for coach routes)
-                            var geopath = await GetStoredGeopath(routeConn, route.RouteGtfsId);
-                            if (geopath != null && geopath.Count > 0)
+                            // Fallback: try GTFS patterns (requires GTFS tables in DB)
+                            try
                             {
-                                route.GeoPaths = new List<List<GeoPoint>> { geopath };
+                                var patterns = await GetAllRoutePatternsFromGtfs(routeConn, route.RouteGtfsId, route.RouteType);
+                                if (patterns.Count > 0)
+                                    route.GeoPaths = patterns.Select(p => p.GeoPath).ToList();
                             }
+                            catch { /* GTFS tables not available in this deployment */ }
                         }
 
                         await routeConn.CloseAsync();
@@ -409,33 +429,6 @@ namespace PTVApp.Services
             await using var conn = new NpgsqlConnection(_connectionString);
             await conn.OpenAsync();
 
-            // Use pgRouting k-shortest paths to get multiple alternative routes
-            // Hub nodes have route_id = 0 and connect all routes at a station
-            // Transfer penalty is built into hub edges (2.5 min each way = 5 min total)
-
-            // Build the edges query with optional replacement bus filtering
-            var edgesQuery = includeReplacementBuses
-                ? "SELECT id, source_node as source, target_node as target, cost FROM edges_v2"
-                : "SELECT id, source_node as source, target_node as target, cost FROM edges_v2 WHERE source_route != 0 OR NOT EXISTS (SELECT 1 FROM routes WHERE routes.route_id = edges_v2.source_route AND routes.is_replacement_bus = true)";
-
-            await using var cmd = new NpgsqlCommand($@"
-                SELECT d.path_id, d.seq, d.node, d.edge, d.cost, d.agg_cost,
-                       (d.node / 1000000000)::int as stop_id,
-                       (d.node % 1000000000)::int as route_id,
-                       s.stop_name, s.stop_latitude, s.stop_longitude,
-                       e.edge_type
-                FROM pgr_ksp(
-                    '{edgesQuery.Replace("'", "''")}',
-                    @origin,
-                    @destination,
-                    @k,
-                    directed := false
-                ) d
-                JOIN stops s ON s.stop_id = (d.node / 1000000000)::int
-                LEFT JOIN edges_v2 e ON e.id = d.edge
-                ORDER BY d.path_id, d.seq;
-            ", conn);
-
             // Determine origin and destination nodes
             // For tram/bus stops: use route nodes to force boarding the vehicle
             // For train/V/Line stations: use hub nodes (they're the backbone)
@@ -449,7 +442,6 @@ namespace PTVApp.Services
 
                 if (originRouteType == 1 || originRouteType == 2) // Tram or Bus
                 {
-                    // Find the first route serving this stop and use that route node
                     await using (var routeCmd = new NpgsqlCommand(
                         @"SELECT DISTINCT source_route FROM edges_v2
                           WHERE (source_stop = @stopId OR target_stop = @stopId)
@@ -460,43 +452,34 @@ namespace PTVApp.Services
                         var originRouteId = await routeCmd.ExecuteScalarAsync() as int?;
                         originNode = originRouteId.HasValue
                             ? (long)originStopId * 1000000000L + originRouteId.Value
-                            : (long)originStopId * 1000000000L; // Fallback to hub if no route found
+                            : (long)originStopId * 1000000000L;
                     }
                 }
                 else
                 {
-                    originNode = (long)originStopId * 1000000000L; // Hub node for train/V/Line
+                    originNode = (long)originStopId * 1000000000L;
                 }
             }
 
-            // Always use hub node for destination (user can alight and transfer as needed)
             destinationNode = (long)destinationStopId * 1000000000L;
 
-            // Must use NpgsqlDbType.Bigint explicitly for pgRouting to accept the parameter
-            cmd.Parameters.Add(new NpgsqlParameter("origin", NpgsqlTypes.NpgsqlDbType.Bigint) { Value = originNode });
-            cmd.Parameters.Add(new NpgsqlParameter("destination", NpgsqlTypes.NpgsqlDbType.Bigint) { Value = destinationNode });
-            cmd.Parameters.Add(new NpgsqlParameter("k", NpgsqlTypes.NpgsqlDbType.Integer) { Value = k });
+            // Run k-shortest paths using in-memory graph (no pgRouting required)
+            if (_routingGraph == null || !_routingGraph.IsLoaded)
+                return (null, null, null);
+
+            var kPathsResult = _routingGraph.KShortestPaths(originNode, destinationNode, k, includeReplacementBuses);
 
             // Collect path nodes grouped by path_id: pathId -> list of (stopId, routeId, lat, lon, aggCost)
             var pathNodesByPathId = new Dictionary<int, List<(int StopId, int RouteId, double Lat, double Lon, double AggCost)>>();
-
-            await using (var reader = await cmd.ExecuteReaderAsync())
+            foreach (var pathNodes in kPathsResult)
             {
-                while (await reader.ReadAsync())
-                {
-                    var pathId = reader.GetInt32(0);
-                    var stopId = reader.GetInt32(6);
-                    var routeId = reader.GetInt32(7);
-
-                    // Skip hub nodes (route_id = 0) - they're only for routing
-                    if (routeId == 0)
-                        continue;
-
-                    if (!pathNodesByPathId.ContainsKey(pathId))
-                        pathNodesByPathId[pathId] = new List<(int, int, double, double, double)>();
-
-                    pathNodesByPathId[pathId].Add((stopId, routeId, reader.GetDouble(9), reader.GetDouble(10), reader.GetDouble(5)));
-                }
+                if (pathNodes.Count == 0) continue;
+                var pathId = pathNodes[0].PathId;
+                var filtered = pathNodes.Where(n => n.RouteId != 0).ToList();
+                if (filtered.Count > 0)
+                    pathNodesByPathId[pathId] = filtered
+                        .Select(n => (n.StopId, n.RouteId, n.Lat, n.Lon, n.AggCost))
+                        .ToList();
             }
 
             if (pathNodesByPathId.Count == 0)
@@ -1020,19 +1003,9 @@ namespace PTVApp.Services
                                                     long fallbackSourceNode = ((long)trip.OriginStopId * 1_000_000_000L) + fallbackBaseRouteId;
                                                     long fallbackTargetNode = ((long)trip.DestinationStopId * 1_000_000_000L) + fallbackBaseRouteId;
 
-                                                    await using var costCmd = new NpgsqlCommand(@"
-                                                        SELECT COALESCE(SUM(cost), 0) FROM pgr_dijkstra(
-                                                            'SELECT id, source_node as source, target_node as target, cost FROM edges_v2 WHERE source_route = ' || @routeId,
-                                                            @sourceNode, @targetNode, false
-                                                        )", conn);
-                                                    costCmd.Parameters.AddWithValue("routeId", fallbackBaseRouteId);
-                                                    costCmd.Parameters.AddWithValue("sourceNode", fallbackSourceNode);
-                                                    costCmd.Parameters.AddWithValue("targetNode", fallbackTargetNode);
-
-                                                    var costResult = await costCmd.ExecuteScalarAsync();
-                                                    if (costResult != null && costResult != DBNull.Value)
+                                                    if (_routingGraph?.IsLoaded == true)
                                                     {
-                                                        var cost = Convert.ToDouble(costResult);
+                                                        var cost = _routingGraph.GetPathCost(fallbackSourceNode, fallbackTargetNode);
                                                         if (cost > 0) estTravelMinutes = cost;
                                                     }
                                                 }
@@ -1068,19 +1041,9 @@ namespace PTVApp.Services
                                                 long fallbackSource1 = ((long)trip.OriginStopId * 1_000_000_000L) + fallbackRouteId1;
                                                 long fallbackTarget1 = ((long)trip.DestinationStopId * 1_000_000_000L) + fallbackRouteId1;
 
-                                                await using var costCmd = new NpgsqlCommand(@"
-                                                    SELECT COALESCE(SUM(cost), 0) FROM pgr_dijkstra(
-                                                        'SELECT id, source_node as source, target_node as target, cost FROM edges_v2 WHERE source_route = ' || @routeId,
-                                                        @sourceNode, @targetNode, false
-                                                    )", conn);
-                                                costCmd.Parameters.AddWithValue("routeId", fallbackRouteId1);
-                                                costCmd.Parameters.AddWithValue("sourceNode", fallbackSource1);
-                                                costCmd.Parameters.AddWithValue("targetNode", fallbackTarget1);
-
-                                                var costResult = await costCmd.ExecuteScalarAsync();
-                                                if (costResult != null && costResult != DBNull.Value)
+                                                if (_routingGraph?.IsLoaded == true)
                                                 {
-                                                    var cost = Convert.ToDouble(costResult);
+                                                    var cost = _routingGraph.GetPathCost(fallbackSource1, fallbackTarget1);
                                                     if (cost > 0) estTravelMinutes = cost;
                                                 }
                                             }
@@ -1119,19 +1082,9 @@ namespace PTVApp.Services
                                             long fallbackSource2 = ((long)trip.OriginStopId * 1_000_000_000L) + fallbackRouteId2;
                                             long fallbackTarget2 = ((long)trip.DestinationStopId * 1_000_000_000L) + fallbackRouteId2;
 
-                                            await using var costCmd = new NpgsqlCommand(@"
-                                                SELECT COALESCE(SUM(cost), 0) FROM pgr_dijkstra(
-                                                    'SELECT id, source_node as source, target_node as target, cost FROM edges_v2 WHERE source_route = ' || @routeId,
-                                                    @sourceNode, @targetNode, false
-                                                )", conn);
-                                            costCmd.Parameters.AddWithValue("routeId", fallbackRouteId2);
-                                            costCmd.Parameters.AddWithValue("sourceNode", fallbackSource2);
-                                            costCmd.Parameters.AddWithValue("targetNode", fallbackTarget2);
-
-                                            var costResult = await costCmd.ExecuteScalarAsync();
-                                            if (costResult != null && costResult != DBNull.Value)
+                                            if (_routingGraph?.IsLoaded == true)
                                             {
-                                                var cost = Convert.ToDouble(costResult);
+                                                var cost = _routingGraph.GetPathCost(fallbackSource2, fallbackTarget2);
                                                 if (cost > 0) estTravelMinutes = cost;
                                             }
                                         }
@@ -1167,27 +1120,10 @@ namespace PTVApp.Services
                                     long sourceNode = ((long)trip.OriginStopId * 1_000_000_000L) + routeIdForGraph;
                                     long targetNode = ((long)trip.DestinationStopId * 1_000_000_000L) + routeIdForGraph;
 
-                                    await using var costCmd = new NpgsqlCommand(@"
-                                        SELECT COALESCE(SUM(cost), 0) as total_cost
-                                        FROM pgr_dijkstra(
-                                            'SELECT id, source_node as source, target_node as target, cost FROM edges_v2 WHERE source_route = ' || @routeId,
-                                            @sourceNode,
-                                            @targetNode,
-                                            false
-                                        )
-                                    ", conn);
-                                    costCmd.Parameters.AddWithValue("routeId", routeIdForGraph);
-                                    costCmd.Parameters.AddWithValue("sourceNode", sourceNode);
-                                    costCmd.Parameters.AddWithValue("targetNode", targetNode);
-
-                                    var costResult = await costCmd.ExecuteScalarAsync();
-                                    if (costResult != null && costResult != DBNull.Value)
+                                    if (_routingGraph?.IsLoaded == true)
                                     {
-                                        var cost = Convert.ToDouble(costResult);
-                                        if (cost > 0)
-                                        {
-                                            graphTravelMinutes = cost;
-                                        }
+                                        var cost = _routingGraph.GetPathCost(sourceNode, targetNode);
+                                        if (cost > 0) graphTravelMinutes = cost;
                                     }
                                 }
                                 catch (Exception graphEx)
@@ -1413,7 +1349,11 @@ namespace PTVApp.Services
 
         private async Task<List<GeoPoint>> GetSegmentGeopath(NpgsqlConnection conn, int fromStopId, int toStopId, int routeId)
         {
+            // Returns empty list if GTFS tables (stop_trip_sequence, shapes) are unavailable.
+            // Caller falls back to straight lines between stops.
             var segment = new List<GeoPoint>();
+            try
+            {
 
             // Find a trip ON THE SPECIFIC ROUTE that goes through both stops
             // Check BOTH directions (forward and reverse) and pick the shortest path
@@ -1519,6 +1459,8 @@ namespace PTVApp.Services
             }
 
             return segment;
+            }
+            catch { return segment; } // GTFS tables unavailable → return empty, caller uses straight lines
         }
 
         public async Task<List<Trip>> PlanTrip(int originStopId, int destinationStopId, int maxResults = 10)
